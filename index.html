@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>toString Converter</title>
+<style>
+:root{--bg:#fff;--fg:#1d2330;--muted:#667085;--border:#d0d5dd;--panel:#f7f8fa;--accent:#2f5fd0;--err:#b42318}
+@media (prefers-color-scheme:dark){:root{--bg:#14171f;--fg:#e6e9f0;--muted:#98a2b3;--border:#2e3442;--panel:#1b1f29;--accent:#7aa2ff;--err:#ff8b80}}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+main{max-width:1200px;margin:0 auto}
+h1{font-size:18px;margin:0 0 4px}
+p.note{color:var(--muted);margin:0 0 12px}
+textarea{width:100%;min-height:120px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--fg);font:13px/1.45 ui-monospace,Menlo,monospace;resize:vertical}
+.opts{display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin:10px 0}
+.opts label{display:flex;gap:6px;align-items:center}
+.opts input[type=text]{width:120px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--fg)}
+.out{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:800px){.out{grid-template-columns:1fr}}
+.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;font-weight:600}
+button{padding:4px 10px;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--fg);cursor:pointer}
+button:hover{border-color:var(--accent)}
+#out-json,#out-java{min-height:320px}
+#err{color:var(--err);min-height:1.4em;margin:4px 0;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<main>
+  <h1>toString Converter</h1>
+  <p class="note">Paste an Immutables <code>Name{field=value, ...}</code> string. Runs entirely in your browser; nothing is sent anywhere.</p>
+  <textarea id="in" spellcheck="false" placeholder="Foo{name=abc, count=3}"></textarea>
+  <div class="opts">
+    <label>Builder class prefix <input type="text" id="prefix" value="Immutable"></label>
+    <label><input type="checkbox" id="enums" checked> UPPER_SNAKE values are enums</label>
+    <label><input type="checkbox" id="numStr"> Keep numbers as strings</label>
+    <button id="sample" type="button">Load sample</button>
+  </div>
+  <div id="err"></div>
+  <div class="out">
+    <section>
+      <div class="head">JSON <button data-copy="out-json" type="button">Copy</button></div>
+      <textarea id="out-json" readonly spellcheck="false"></textarea>
+    </section>
+    <section>
+      <div class="head">Java (Immutables builder) <button data-copy="out-java" type="button">Copy</button></div>
+      <textarea id="out-java" readonly spellcheck="false"></textarea>
+    </section>
+  </div>
+  <p class="note">Types are guessed from text. Enums use the field name as the type (<code>status=ACTIVE</code> becomes <code>Status.ACTIVE</code>), so fix those and any numeric strings by hand. Null and empty optionals are skipped in the Java output.</p>
+</main>
+<script>
+// CORE-START
+const FIELD_RE = /^,\s*[A-Za-z_$][\w$]*=/;
+const MAP_ENTRY_RE = /^,\s*[^,=\[\]{}]+=/;
+
+function parseToString(s, opts) {
+  let i = 0;
+  const fail = m => { throw new Error(`${m} at position ${i}: ...${s.slice(Math.max(0, i - 25), i + 25)}...`); };
+  const warn = () => { if (opts.warnings && !opts.warnings.length) opts.warnings.push('Input looks truncated (missing closing braces); auto-closed.'); };
+  const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+
+  function parseValue(ctx) {
+    ws();
+    const rest = s.slice(i);
+    let m = /^([A-Za-z_$][\w$.]*)\{/.exec(rest);
+    if (m) { i += m[0].length; return parseObject(m[1]); }
+    if (s[i] === '[') { i++; return parseList(); }
+    if (s[i] === '{') { i++; return parseMap(); }
+    if (rest.startsWith('Optional[')) {
+      i += 9;
+      const v = parseValue('list');
+      ws();
+      if (s[i] === ']') i++; else if (i >= s.length) warn(); else fail('Expected ] closing Optional');
+      return v;
+    }
+    return parseScalar(ctx);
+  }
+
+  function parseScalar(ctx) {
+    const start = i;
+    let depth = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === '[' || c === '{') depth++;
+      else if (c === ']' || c === '}') { if (depth === 0) break; depth--; }
+      else if (c === ',' && depth === 0) {
+        const rest = s.slice(i);
+        if (ctx === 'list' || (ctx === 'map' ? MAP_ENTRY_RE : FIELD_RE).test(rest)) break;
+      }
+      i++;
+    }
+    return classify(s.slice(start, i).trim(), opts);
+  }
+
+  function parseObject(name) {
+    const fields = [];
+    ws();
+    if (s[i] === '}') { i++; return { t: 'obj', name, fields }; }
+    for (;;) {
+      ws();
+      const m = /^([A-Za-z_$][\w$]*)=/.exec(s.slice(i));
+      if (!m) fail('Expected field name');
+      i += m[0].length;
+      fields.push([m[1], parseValue('obj')]);
+      ws();
+      if (s[i] === ',') { i++; continue; }
+      if (s[i] === '}') { i++; break; }
+      if (i >= s.length) { warn(); break; }
+      fail('Expected , or }');
+    }
+    return { t: 'obj', name, fields };
+  }
+
+  function parseList() {
+    const items = [];
+    ws();
+    if (s[i] === ']') { i++; return { t: 'list', items }; }
+    for (;;) {
+      items.push(parseValue('list'));
+      ws();
+      if (s[i] === ',') { i++; continue; }
+      if (s[i] === ']') { i++; break; }
+      if (i >= s.length) { warn(); break; }
+      fail('Expected , or ]');
+    }
+    return { t: 'list', items };
+  }
+
+  function parseMap() {
+    const fields = [];
+    ws();
+    if (s[i] === '}') { i++; return { t: 'map', fields }; }
+    for (;;) {
+      ws();
+      const eq = s.indexOf('=', i);
+      if (eq < 0) fail('Expected key=value');
+      const key = s.slice(i, eq).trim();
+      i = eq + 1;
+      fields.push([key, parseValue('map')]);
+      ws();
+      if (s[i] === ',') { i++; continue; }
+      if (s[i] === '}') { i++; break; }
+      if (i >= s.length) { warn(); break; }
+      fail('Expected , or }');
+    }
+    return { t: 'map', fields };
+  }
+
+  const start = /[A-Za-z_$][\w$.]*\{/.exec(s);
+  if (!start) fail('No Name{...} found');
+  i = start.index + start[0].length;
+  return parseObject(start[0].slice(0, -1));
+}
+
+function classify(raw, opts) {
+  const s = kind => ({ t: 's', kind, raw });
+  if (raw === 'null' || raw === 'Optional.empty' || raw === 'Optional.empty()') return { t: 's', kind: 'null', raw: 'null' };
+  if (raw === 'true' || raw === 'false') return s('bool');
+  if (!opts.numbersAsStrings) {
+    if (/^-?\d+$/.test(raw)) {
+      const v = BigInt(raw);
+      return s(v > 2147483647n || v < -2147483648n ? 'long' : 'int');
+    }
+    if (/^-?\d+\.\d+([eE][+-]?\d+)?$/.test(raw)) return s('double');
+  }
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) return s('uuid');
+  if (/^\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d+)?)?Z$/.test(raw)) return s('instant');
+  if (/^\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d+)?)?$/.test(raw)) return s('datetime');
+  if (/^\d{4}-\d\d-\d\d$/.test(raw)) return s('date');
+  if (/^PT(?=\d)[\dHMS.]+$/.test(raw)) return s('duration');
+  if (opts.enums && /^([A-Z]{2,}|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+)$/.test(raw)) return s('enum');
+  return s('string');
+}
+
+function toJson(n, ind = 0) {
+  const pad = '  '.repeat(ind + 1), end = '  '.repeat(ind);
+  switch (n.t) {
+    case 'obj':
+    case 'map':
+      if (!n.fields.length) return '{}';
+      return '{\n' + n.fields.map(([k, v]) => `${pad}${JSON.stringify(k)}: ${toJson(v, ind + 1)}`).join(',\n') + `\n${end}}`;
+    case 'list':
+      if (!n.items.length) return '[]';
+      return '[\n' + n.items.map(v => pad + toJson(v, ind + 1)).join(',\n') + `\n${end}]`;
+    default:
+      return ['null', 'bool', 'int', 'long', 'double'].includes(n.kind) ? n.raw : JSON.stringify(n.raw);
+  }
+}
+
+function toJava(root, opts) {
+  const used = new Set();
+  const cap = x => x.charAt(0).toUpperCase() + x.slice(1);
+  const q = JSON.stringify;
+  const spaces = n => ' '.repeat(n);
+
+  // Multi-line arguments if any element spans lines, else one line.
+  const args = (exprs, ind) => exprs.some(e => e.includes('\n'))
+    ? `\n${spaces(ind + 4)}${exprs.join(`,\n${spaces(ind + 4)}`)}`
+    : exprs.join(', ');
+
+  function expr(n, hint, ind) {
+    switch (n.t) {
+      case 'obj': return builder(n, ind);
+      case 'list':
+        used.add('java.util.List');
+        return `List.of(${args(n.items.map(x => expr(x, hint, ind + 4)), ind)})`;
+      case 'map':
+        used.add('java.util.Map');
+        return `Map.ofEntries(${args(n.fields.map(([k, v]) => `Map.entry(${q(k)}, ${expr(v, hint, ind + 4)})`), ind)})`;
+      default:
+        switch (n.kind) {
+          case 'null': return 'null';
+          case 'bool': case 'int': case 'double': return n.raw;
+          case 'long': return n.raw + 'L';
+          case 'uuid': used.add('java.util.UUID'); return `UUID.fromString(${q(n.raw)})`;
+          case 'instant': used.add('java.time.Instant'); return `Instant.parse(${q(n.raw)})`;
+          case 'datetime': used.add('java.time.LocalDateTime'); return `LocalDateTime.parse(${q(n.raw)})`;
+          case 'date': used.add('java.time.LocalDate'); return `LocalDate.parse(${q(n.raw)})`;
+          case 'duration': used.add('java.time.Duration'); return `Duration.parse(${q(n.raw)})`;
+          case 'enum': return `${cap(hint)}.${n.raw}`;
+          default: return q(n.raw);
+        }
+    }
+  }
+
+  function builder(n, ind) {
+    const cls = n.name.startsWith(opts.prefix) ? n.name : opts.prefix + n.name;
+    const pad = spaces(ind + 4);
+    let out = `${cls}.builder()`;
+    for (const [k, v] of n.fields) {
+      if (v.t === 's' && v.kind === 'null') continue;
+      if ((v.t === 'list' && !v.items.length) || (v.t === 'map' && !v.fields.length)) continue;
+      const verb = v.t === 'list' ? `addAll${cap(k)}` : v.t === 'map' ? `putAll${cap(k)}` : k;
+      out += `\n${pad}.${verb}(${expr(v, k, ind + 4)})`;
+    }
+    return out + `\n${pad}.build()`;
+  }
+
+  const body = builder(root, 0);
+  const varName = root.name.charAt(0).toLowerCase() + root.name.slice(1);
+  const imports = [...used].sort().map(u => `import ${u};`).join('\n');
+  return (imports ? imports + '\n\n' : '') + `${root.name} ${varName} = ${body};`;
+}
+// CORE-END
+
+const $ = id => document.getElementById(id);
+const SAMPLE = 'OrderRequest{id=3f2b8c1e-7d4a-4c1b-9f0e-2a6d5b8e1c40, status=PENDING, amount=12.5, retries=3, createdAt=2024-05-01T10:15:30Z, customer=Customer{name=Ann, Lee, tags=[a, b]}, items=[Item{sku=A1, qty=2}, Item{sku=B2, qty=1}], attributes={k1=v1, k2=v2}, note=Optional[hello]}';
+
+function convert() {
+  const text = $('in').value.trim();
+  $('err').textContent = '';
+  if (!text) { $('out-json').value = ''; $('out-java').value = ''; return; }
+  const opts = { enums: $('enums').checked, numbersAsStrings: $('numStr').checked, prefix: $('prefix').value, warnings: [] };
+  try {
+    const tree = parseToString(text, opts);
+    $('out-json').value = toJson(tree);
+    $('out-java').value = toJava(tree, opts);
+    $('err').textContent = opts.warnings.join(' ');
+  } catch (e) {
+    $('out-json').value = ''; $('out-java').value = '';
+    $('err').textContent = e.message;
+  }
+}
+
+['in', 'prefix', 'enums', 'numStr'].forEach(id => $(id).addEventListener('input', convert));
+$('sample').addEventListener('click', () => { $('in').value = SAMPLE; convert(); });
+document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', async () => {
+  const el = $(b.dataset.copy);
+  try { await navigator.clipboard.writeText(el.value); }
+  catch { el.select(); document.execCommand('copy'); }
+  const old = b.textContent; b.textContent = 'Copied'; setTimeout(() => b.textContent = old, 1000);
+}));
+</script>
+</body>
+</html>
